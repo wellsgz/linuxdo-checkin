@@ -255,11 +255,13 @@ class LinuxDoBrowser:
         except Exception as e:
             logger.error(f"点赞失败: {str(e)}")
 
+    @retry_decorator(retries=3)
     def print_connect_info(self):
         logger.info("获取连接信息")
         page = self.browser.new_tab()
         page.get("https://connect.linux.do/")
-        rows = page.ele("tag:table").eles("tag:tr")
+        time.sleep(3)  # Wait for page to load
+        rows = page.ele("tag:table", timeout=10).eles("tag:tr")
 
         info = []
 
@@ -271,8 +273,11 @@ class LinuxDoBrowser:
                 requirement = cells[2].text.strip()
                 info.append([project, current, requirement])
 
-        print("--------------Connect Info-----------------")
-        print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+        if info:
+            print("--------------Connect Info-----------------")
+            print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+        else:
+            logger.warning("未能获取到连接信息数据")
 
         page.close()
 
