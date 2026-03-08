@@ -7,16 +7,15 @@ import os
 import random
 import time
 import functools
-import sys
-import re
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
 from curl_cffi import requests
 from bs4 import BeautifulSoup
+from notify import NotificationManager
 
 
-def retry_decorator(retries=3):
+def retry_decorator(retries=3, min_delay=5, max_delay=10):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -29,7 +28,12 @@ def retry_decorator(retries=3):
                     logger.warning(
                         f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
                     )
-                    time.sleep(1)
+                    if attempt < retries - 1:
+                        sleep_s = random.uniform(min_delay, max_delay)
+                        logger.info(
+                            f"将在 {sleep_s:.2f}s 后重试 ({min_delay}-{max_delay}s 随机延迟)"
+                        )
+                        time.sleep(sleep_s)
             return None
 
         return wrapper
@@ -42,6 +46,7 @@ os.environ.pop("DYLD_LIBRARY_PATH", None)
 
 USERNAME = os.environ.get("LINUXDO_USERNAME")
 PASSWORD = os.environ.get("LINUXDO_PASSWORD")
+COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串，优先使用
 BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
     "false",
     "0",
@@ -51,9 +56,6 @@ if not USERNAME:
     USERNAME = os.environ.get("USERNAME")
 if not PASSWORD:
     PASSWORD = os.environ.get("PASSWORD")
-GOTIFY_URL = os.environ.get("GOTIFY_URL")  # Gotify 服务器地址
-GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")  # Gotify 应用的 API Token
-SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")  # Server酱³ SendKey
 
 HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
@@ -71,6 +73,8 @@ class LinuxDoBrowser:
             platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
         elif platform == "win32":
             platformIdentifier = "Windows NT 10.0; Win64; x64"
+        else:
+            platformIdentifier = "X11; Linux x86_64"
 
         co = (
             ChromiumOptions()
@@ -91,9 +95,68 @@ class LinuxDoBrowser:
                 "Accept-Language": "zh-CN,zh;q=0.9",
             }
         )
+        # 初始化通知管理器
+        self.notifier = NotificationManager()
+
+    @staticmethod
+    def parse_cookie_string(cookie_str: str) -> list[dict]:
+        """
+        解析浏览器复制的 Cookie 字符串格式: "name1=value1; name2=value2"
+        返回 DrissionPage 所需的 cookie 列表格式。
+        """
+        cookies = []
+        for part in cookie_str.strip().split(";"):
+            part = part.strip()
+            if "=" in part:
+                name, _, value = part.partition("=")
+                cookies.append(
+                    {
+                        "name": name.strip(),
+                        "value": value.strip(),
+                        "domain": ".linux.do",
+                        "path": "/",
+                    }
+                )
+        return cookies
+
+    def login_with_cookies(self, cookie_str: str) -> bool:
+        """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
+        logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
+        dp_cookies = self.parse_cookie_string(cookie_str)
+        if not dp_cookies:
+            logger.error("Cookie 解析失败或为空，无法使用 Cookie 登录")
+            return False
+
+        logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
+
+        # 同步到 requests.Session，以便后续 API 请求（如 print_connect_info）使用
+        for ck in dp_cookies:
+            self.session.cookies.set(ck["name"], ck["value"], domain="linux.do")
+
+        # 同步到 DrissionPage
+        self.page.set.cookies(dp_cookies)
+        logger.info("Cookie 设置完成，导航至 linux.do...")
+        self.page.get(HOME_URL)
+        time.sleep(5)
+
+        # 验证登录状态
+        try:
+            user_ele = self.page.ele("@id=current-user")
+        except Exception as e:
+            logger.warning(f"Cookie 登录验证异常: {str(e)}")
+            return True
+        if not user_ele:
+            if "avatar" in self.page.html:
+                logger.info("Cookie 登录验证成功 (通过 avatar)")
+                return True
+            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+            return False
+        else:
+            logger.info("Cookie 登录验证成功")
+            return True
 
     def login(self):
-        logger.info("开始登录")
+        logger.info("开始账号密码登录")
         # Step 1: Get CSRF Token
         logger.info("获取 CSRF token...")
         headers = {
@@ -103,7 +166,10 @@ class LinuxDoBrowser:
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
+        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="firefox135")
+        if resp_csrf.status_code != 200:
+            logger.error(f"获取 CSRF token 失败: {resp_csrf.status_code}")
+            return False        
         csrf_data = resp_csrf.json()
         csrf_token = csrf_data.get("csrf")
         logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
@@ -144,18 +210,8 @@ class LinuxDoBrowser:
             logger.error(f"登录请求异常: {e}")
             return False
 
-        self.print_connect_info()  # 打印连接信息
-
         # Step 3: Pass cookies to DrissionPage
         logger.info("同步 Cookie 到 DrissionPage...")
-
-        # Convert requests cookies to DrissionPage format
-        # Using standard requests.utils to parse cookiejar if possible, or manual extraction
-        # requests.Session().cookies is a specialized object, but might support standard iteration
-
-        # We can iterate over the cookies manually if dict_from_cookiejar doesn't work perfectly
-        # or convert to dict first.
-        # Assuming requests behaves like requests:
 
         cookies_dict = self.session.cookies.get_dict()
 
@@ -205,11 +261,16 @@ class LinuxDoBrowser:
     @retry_decorator()
     def click_one_topic(self, topic_url):
         new_page = self.browser.new_tab()
-        new_page.get(topic_url)
-        if random.random() < 0.3:  # 0.3 * 30 = 9
-            self.click_like(new_page)
-        self.browse_post(new_page)
-        new_page.close()
+        try:
+            new_page.get(topic_url)
+            if random.random() < 0.3:  # 0.3 * 30 = 9
+                self.click_like(new_page)
+            self.browse_post(new_page)
+        finally:
+            try:
+                new_page.close()
+            except Exception:
+                pass
 
     def browse_post(self, page):
         prev_url = None
@@ -242,20 +303,35 @@ class LinuxDoBrowser:
             time.sleep(wait_time)
 
     def run(self):
-        login_res = self.login()
-        if not login_res:  # 登录
-            logger.warning("登录验证失败")
+        try:
+            # 优先使用手动 Cookie 登录，没有再使用账号密码
+            if COOKIES:
+                login_res = self.login_with_cookies(COOKIES)
+                if not login_res:
+                    logger.warning("Cookie 登录失败，尝试账号密码登录...")
+                    login_res = self.login()
+            else:
+                login_res = self.login()
+            if not login_res:  # 登录
+                logger.warning("登录验证失败")
 
-        if BROWSE_ENABLED:
-            click_topic_res = self.click_topic()  # 点击主题
-            if not click_topic_res:
-                logger.error("点击主题失败，程序终止")
-                return
-            logger.info("完成浏览任务")
-
-        self.send_notifications(BROWSE_ENABLED)  # 发送通知
-        self.page.close()
-        self.browser.quit()
+            if BROWSE_ENABLED:
+                click_topic_res = self.click_topic()  # 点击主题
+                if not click_topic_res:
+                    logger.error("点击主题失败，程序终止")
+                    return
+                logger.info("完成浏览任务")
+            self.print_connect_info()  # 打印连接信息
+            self.send_notifications(BROWSE_ENABLED)  # 发送通知
+        finally:
+            try:
+                self.page.close()
+            except Exception:
+                pass
+            try:
+                self.browser.quit()
+            except Exception:
+                pass
 
     def click_like(self, page):
         try:
@@ -291,59 +367,22 @@ class LinuxDoBrowser:
                 requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
                 info.append([project, current, requirement])
 
-        print("--------------Connect Info-----------------")
-        print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+        logger.info("--------------Connect Info-----------------")
+        logger.info("\n" + tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
 
     def send_notifications(self, browse_enabled):
-        status_msg = "✅每日登录成功: {USERNAME}"
+        """发送签到通知"""
+        status_msg = f"✅每日登录成功: {USERNAME}"
         if browse_enabled:
             status_msg += " + 浏览任务完成"
-
-        if GOTIFY_URL and GOTIFY_TOKEN:
-            try:
-                response = requests.post(
-                    f"{GOTIFY_URL}/message",
-                    params={"token": GOTIFY_TOKEN},
-                    json={"title": "LINUX DO", "message": status_msg, "priority": 1},
-                    timeout=10,
-                )
-                response.raise_for_status()
-                logger.success("消息已推送至Gotify")
-            except Exception as e:
-                logger.error(f"Gotify推送失败: {str(e)}")
-        else:
-            logger.info("未配置Gotify环境变量，跳过通知发送")
-
-        if SC3_PUSH_KEY:
-            match = re.match(r"sct(\d+)t", SC3_PUSH_KEY, re.I)
-            if not match:
-                logger.error(
-                    "❌ SC3_PUSH_KEY格式错误，未获取到UID，无法使用Server酱³推送"
-                )
-                return
-
-            uid = match.group(1)
-            url = f"https://{uid}.push.ft07.com/send/{SC3_PUSH_KEY}"
-            params = {"title": "LINUX DO", "desp": status_msg}
-
-            attempts = 5
-            for attempt in range(attempts):
-                try:
-                    response = requests.get(url, params=params, timeout=10)
-                    response.raise_for_status()
-                    logger.success(f"Server酱³推送成功: {response.text}")
-                    break
-                except Exception as e:
-                    logger.error(f"Server酱³推送失败: {str(e)}")
-                    if attempt < attempts - 1:
-                        sleep_time = random.randint(180, 360)
-                        logger.info(f"将在 {sleep_time} 秒后重试...")
-                        time.sleep(sleep_time)
+        
+        # 使用通知管理器发送所有通知
+        self.notifier.send_all("LINUX DO", status_msg)
 
 
 if __name__ == "__main__":
-    if not USERNAME or not PASSWORD:
-        print("Please set USERNAME and PASSWORD")
+    if not COOKIES and (not USERNAME or not PASSWORD):
+        print("请设置 LINUXDO_COOKIES（Cookie 登录），或同时设置 USERNAME 和 PASSWORD（账号密码登录）")
         exit(1)
-    l = LinuxDoBrowser()
-    l.run()
+    browser = LinuxDoBrowser()
+    browser.run()
